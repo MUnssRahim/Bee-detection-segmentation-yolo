@@ -3,4 +3,5 @@ uvicorn
 python-multipart
 numpy
 ultralytics
+onnxruntime
 opencv-python-headless

@@ -6,12 +6,11 @@ import os
 
 app = FastAPI()
 
-# ---------------------------------------------------------
-# 1. LOAD MODELS (Global Context)
-# ---------------------------------------------------------
-# using relative paths for Vercel structure
-model_path_pests = "./models/Beetle_Drone_Varroa.pt"
-model_path_queen = "./models/ModelIterationDeteection2.pt"
+
+model_path_pests = "./models/Beetle_Drone_Varroa.onnx"
+model_path_queen = "./models/ModelIterationDeteection2.onnx"
+
+# The rest of your code (model_pests(img...)) remains the same!
 
 model_pests = None
 model_queen = None
