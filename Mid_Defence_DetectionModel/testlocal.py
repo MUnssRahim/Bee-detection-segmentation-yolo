@@ -5,7 +5,7 @@ import os
 
 # CONFIGURATION
 API_URL = "http://127.0.0.1:8000/detect"
-TEST_IMAGE = r"C:\Users\HP\Desktop\Bees\Mid_Defence_DetectionModel\WhatsApp Image 2026-01-21 at 11.21.35 AM (1).jpeg"  # <--- Make sure this image exists!
+TEST_IMAGE = r"C:\Users\HP\Documents\GitHub\Bees_Segmentation_detection-\Mid_Defence_DetectionModel\WhatsApp Image 2026-01-21 at 11.24.52 AM (1).jpeg"  # <--- Make sure this image exists!
 
 def run_visual_test():
     if not os.path.exists(TEST_IMAGE):

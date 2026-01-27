@@ -6,26 +6,32 @@ import os
 
 app = FastAPI()
 
-
+# ---------------------------------------------------------
+# 1. LOAD MODELS (Corrected for Capital 'M' folder)
+# ---------------------------------------------------------
+# Paths must match your GitHub folder EXACTLY
 model_path_pests = "./Models/Beetle_Drone_Varroa.onnx"
 model_path_queen = "./Models/ModelIterationDeteection2.onnx"
-
-# The rest of your code (model_pests(img...)) remains the same!
 
 model_pests = None
 model_queen = None
 
+# Load Pests Model
 if os.path.exists(model_path_pests):
-    print(f"Loading Pest Model from: {model_path_pests}")
-    model_pests = YOLO(model_path_pests)
+    print(f"Loading Pest Model: {model_path_pests}")
+    model_pests = YOLO(model_path_pests, task='detect')
 else:
-    print(f"WARNING: Pest Model not found at {model_path_pests}")
+    print(f"CRITICAL WARNING: Pest Model not found at {model_path_pests}")
+    # Fallback checks to help debug on Vercel logs
+    if os.path.exists("./models/Beetle_Drone_Varroa.onnx"):
+        print("Found in lowercase 'models' instead. Please fix capitalization.")
 
+# Load Queen Model
 if os.path.exists(model_path_queen):
-    print(f"Loading Queen Model from: {model_path_queen}")
-    model_queen = YOLO(model_path_queen)
+    print(f"Loading Queen Model: {model_path_queen}")
+    model_queen = YOLO(model_path_queen, task='detect')
 else:
-    print(f"WARNING: Queen Model not found at {model_path_queen}")
+    print(f"CRITICAL WARNING: Queen Model not found at {model_path_queen}")
 
 
 # ---------------------------------------------------------
@@ -38,10 +44,7 @@ COLORS = {
     "queen":             (0, 255, 255),     # Yellow
 }
 
-# Classes to completely hide (No Box, No Count)
 HIDDEN = ["bee"]
-
-# Classes to ignore logic (e.g. adult drones)
 IGNORE = ["drone", "drone-bee"] 
 
 
@@ -80,50 +83,39 @@ def process_image(img_bytes):
             names.extend([r.names] * len(r.boxes))
 
     # --- Draw Results ---
-    # Initialize counts to 0 for specific keys we care about
     counts = {k: 0 for k in COLORS}
     
     for box, name_dict in zip(boxes, names):
         cls_id = int(box.cls[0])
         cname = name_dict[cls_id]
         
-        # Check Filters
         if cname in IGNORE: continue
         if cname in HIDDEN: continue
 
-        # Increment Count
         if cname in counts:
             counts[cname] += 1
-        elif cname in COLORS: # Safety check if model has extra classes
+        elif cname in COLORS:
             counts[cname] = 1
 
-        # Draw Box (Strictly box only, no text)
         color = COLORS.get(cname, (255, 255, 255))
         x1, y1, x2, y2 = map(int, box.xyxy[0])
         cv2.rectangle(img, (x1, y1), (x2, y2), color, 3)
 
-    # --- Draw Legend (Top-Left) ---
+    # --- Draw Legend ---
     y = 50
     for name, count in counts.items():
-        if count >= 0: # Show all listed in COLORS, even if 0
+        if count >= 0:
             color = COLORS.get(name, (255, 255, 255))
             
-            # 1. Draw Icon
             cv2.rectangle(img, (30, y-20), (55, y+5), color, -1)
             cv2.rectangle(img, (30, y-20), (55, y+5), (255,255,255), 2)
             
-            # 2. Draw Text (No Bee Count)
             text = f"{name.replace('-', ' ').title()}: {count}"
-            
-            # Stroke (Black Outline)
             cv2.putText(img, text, (70, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 4)
-            # Fill (Color)
             cv2.putText(img, text, (70, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
             
             y += 40
 
-    # --- Convert to JPG ---
-    # This encodes the numpy array into JPEG bytes
     success, encoded_image = cv2.imencode('.jpg', img)
     if not success:
         return None
@@ -135,7 +127,7 @@ def process_image(img_bytes):
 # ---------------------------------------------------------
 @app.get("/")
 def read_root():
-    return {"status": "Bee Detection API Active"}
+    return {"status": "Bee Detection API Active (ONNX)"}
 
 @app.post("/detect")
 async def detect(file: UploadFile):
