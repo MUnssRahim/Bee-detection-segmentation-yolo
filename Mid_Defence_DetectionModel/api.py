@@ -7,8 +7,8 @@ import os
 app = FastAPI()
 
 
-model_path_pests = "./models/Beetle_Drone_Varroa.onnx"
-model_path_queen = "./models/ModelIterationDeteection2.onnx"
+model_path_pests = "./Models/Beetle_Drone_Varroa.onnx"
+model_path_queen = "./Models/ModelIterationDeteection2.onnx"
 
 # The rest of your code (model_pests(img...)) remains the same!
 
