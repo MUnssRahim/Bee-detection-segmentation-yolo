@@ -5,14 +5,13 @@ python-multipart==0.0.9
 numpy==1.26.4
 opencv-python-headless==4.9.0.80
 
-# 1. OPTIMIZATION: Use the CPU-only version of ONNX Runtime (Much smaller/faster)
-onnxruntime-cpu==1.17.3
+# CORRECTED: Use the standard name (this IS the CPU version)
+onnxruntime==1.17.3
 
-# 2. CRITICAL FIX: Force the CPU version of PyTorch BEFORE installing Ultralytics
-# This tells pip to look at the CPU-specific repository first.
+# KEEP THIS: This is the magic line that prevents the 3-hour download
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
 
-# 3. Now install Ultralytics (it will see torch is already handled and skip the big download)
+# Install this last so it uses the lightweight torch we defined above
 ultralytics==8.2.30
