@@ -1,19 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 fastapi==0.110.0
 uvicorn==0.29.0
 gunicorn==21.2.0
 python-multipart==0.0.9
 numpy==1.26.4
-
-# CRITICAL: Install this specific version BEFORE ultralytics to block the crash
 opencv-python-headless==4.9.0.80
-
-# Use standard ONNX Runtime
 onnxruntime==1.17.3
-
-# Pytorch (CPU only to save space)
---extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
-
-# Install Ultralytics last. It will see OpenCV is already there and won't install the bad one.
 ultralytics==8.2.30
