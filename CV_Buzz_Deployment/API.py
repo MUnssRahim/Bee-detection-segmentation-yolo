@@ -1,331 +1,294 @@
 import os
 import cv2
 import numpy as np
-import base64
 import logging
-import uvicorn
-from fastapi import FastAPI, File, UploadFile
+import base64
+import gc
+from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import JSONResponse
+from contextlib import asynccontextmanager
 from ultralytics import YOLO
+import torch
 
-# --- 1. Configure Logging ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+# --- 1. Configuration & Constants ---
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - [%(levelname)s] - BuzzGuard: %(message)s")
 
-# --- 2. Initialize FastAPI ---
-app = FastAPI(title="BuzzGuard AI Analyzer")
-
-# --- 3. Model Paths & Verification ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_BEE_SEG_PATH = os.path.join(SCRIPT_DIR, "Bee_Seg.pt")
-MODEL_DB_PATH = os.path.join(SCRIPT_DIR, "B_D_V.pt")
-MODEL_LW_PATH = os.path.join(SCRIPT_DIR, "L_F_W.pt")
-MODEL_CLASS_PATH = os.path.join(SCRIPT_DIR, "B_Q_PB.pt")
+MODEL_SEG_PATH = os.path.join(SCRIPT_DIR, "Bee_Seg.pt")     
+MODEL_MAIN_PATH = os.path.join(SCRIPT_DIR, "Combined_Final.pt")  
+MODEL_DRONE_PATH = os.path.join(SCRIPT_DIR, "B_D_V.pt")     
 
-logging.info("Verifying model paths...")
-for label, path in [("Segmentation", MODEL_BEE_SEG_PATH), 
-                    ("Detection", MODEL_DB_PATH), 
-                    ("Larvae", MODEL_LW_PATH), 
-                    ("Classification", MODEL_CLASS_PATH)]:
-    if os.path.exists(path):
-        logging.info(f"✅ {label} model found in local directory: {path}")
-    else:
-        logging.error(f"❌ ERROR: {label} model missing at: {path}")
-
-# --- 4. Constants & Thresholds ---
 TARGET_WIDTH = 1280
 TILE_SIZE = 640
-OVERLAP = 0.20
+OVERLAP = 0.20  # Optimized for speed and lower memory footprint
+CROP_MARGIN = 0.12 
+TILE_BATCH_SIZE = 4  # Reduced batch size to prevent RAM spikes on Railway
 
-SEG_CONF = 0.40
-MIN_BEE_AREA = 800
-DET_CONF = 0.35
-MITE_CONF = 0.35
-CLASS_CONF = 0.30
+# FORCED CPU: Railway does not have GPUs. Forcing CPU prevents PyTorch from allocating CUDA memory.
+USE_HALF_PRECISION = False 
+DEVICE = "cpu"
+
+CONF_THRESHOLDS = {
+    "seg": 0.25,
+    "base_det": 0.20,
+    "mite": 0.1,
+    "pollen": 0.30,
+    "queen": 0.35,
+    "damage": 0.6  
+}
+MIN_BEE_AREA = 600     
 NMS_THRESH = 0.45
 
 COLORS = {
-    "pollenbee": (0, 255, 0), "queen": (255, 0, 255),
-    "mite": (0, 0, 255), "drone_cell": (255, 0, 0), "beetle": (0, 0, 200),
-    "larvae": (0, 165, 255), "web": (255, 255, 255)
+    "drone_cell": (255, 100, 50),   
+    "mite": (0, 0, 255),            
+    "damage": (0, 140, 255),        
+    "pollen": (0, 240, 255),        
+    "queen": (50, 255, 50),         
+    "larvae": (255, 255, 0)         
 }
 
-# --- 5. Load Models to CPU ---
-logging.info("Loading Models to CPU...")
-try:
-    model_seg = YOLO(MODEL_BEE_SEG_PATH, task="segment")
-    model_db = YOLO(MODEL_DB_PATH, task="detect")
-    model_lw = YOLO(MODEL_LW_PATH, task="detect")
-    model_class = YOLO(MODEL_CLASS_PATH, task="detect")
-    logging.info("Models successfully loaded to memory.")
-except Exception as e:
-    logging.error(f"Error loading models: {e}")
+# --- 2. Core Vision Operations ---
+class VisionOps:
+    @staticmethod
+    def order_points(pts):
+        rect = np.zeros((4, 2), dtype="float32")
+        s = pts.sum(axis=1)
+        rect[0], rect[2] = pts[np.argmin(s)], pts[np.argmax(s)]
+        diff = np.diff(pts, axis=1)
+        rect[1], rect[3] = pts[np.argmin(diff)], pts[np.argmax(diff)]
+        return rect
 
-# --- 6. Helper Functions ---
-def get_true_corners(hull):
-    x, y, w, h = cv2.boundingRect(hull)
-    bbox_corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]])
-    hull_pts = hull.reshape(-1, 2)
-    rect = np.zeros((4, 2), dtype="float32")
-    for i in range(4):
-        corner = bbox_corners[i]
-        distances = np.linalg.norm(hull_pts - corner, axis=1)
-        closest_index = np.argmin(distances)
-        rect[i] = hull_pts[closest_index]
-    return rect
-
-def auto_crop_and_straighten(img):
-    logging.info("Starting auto-crop and straightening process.")
-    img_h, img_w = img.shape[:2]
-    total_area = img_h * img_w
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (11, 11), 0)
-    edges = cv2.Canny(blurred, 30, 120)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
-    fused_mask = cv2.dilate(edges, kernel, iterations=4)
-    fused_mask = cv2.erode(fused_mask, kernel, iterations=2)
-    contours, _ = cv2.findContours(fused_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
-    if not contours:
-        return img
+    @staticmethod
+    def isolate_comb(img, margin_percent):
+        h_orig, w_orig = img.shape[:2]
         
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    largest_contour = contours[0]
-    
-    if cv2.contourArea(largest_contour) < total_area * 0.15:
-        return img
+        # Memory/Speed Optimization: Downscale for morphology
+        scale = 0.25
+        small_img = cv2.resize(img, (int(w_orig * scale), int(h_orig * scale)))
+        gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (15, 15), 0) 
+        edges = cv2.Canny(blurred, 30, 100)
         
-    hull = cv2.convexHull(largest_contour)
-    rect_ordered = get_true_corners(hull)
-    (tl, tr, br, bl) = rect_ordered
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    maxWidth = max(int(widthA), int(widthB))
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    maxHeight = max(int(heightA), int(heightB))
-    
-    dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
-    M = cv2.getPerspectiveTransform(rect_ordered, dst)
-    warped = cv2.warpPerspective(img, M, (maxWidth, maxHeight))
-    
-    if maxHeight > maxWidth:
-        warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21))
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-    margin = int(min(maxWidth, maxHeight) * 0.015)
-    final_h, final_w = warped.shape[:2]
-    return warped[margin:final_h - margin, margin:final_w - margin]
+        if not contours: return img 
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        if cv2.contourArea(largest_contour) < (gray.shape[0] * gray.shape[1] * 0.15): return img 
 
-def fast_preprocess(img):
-    logging.info("Starting fast preprocessing (CLAHE & Blurring).")
-    h, w = img.shape[:2]
-    new_h = int(h * (TARGET_WIDTH / w))
-    img = cv2.resize(img, (TARGET_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
-    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    cl = clahe.apply(l)
-    limg = cv2.merge((cl, a, b))
-    img = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-    img = cv2.GaussianBlur(img, (3, 3), 0)
-    return img
+        rect = cv2.minAreaRect(largest_contour)
+        box = cv2.boxPoints(rect) if hasattr(cv2, 'boxPoints') else cv2.cv.BoxPoints(rect)
+        
+        box = box / scale 
+        rect_pts = VisionOps.order_points(np.int32(box))
+        (tl, tr, br, bl) = rect_pts
 
-def draw_commercial_box(img, x, y, w, h, label, color):
-    cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
-    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.rectangle(img, (x, y - text_h - 6), (x + text_w + 4, y), color, -1)
-    cv2.putText(img, label, (x + 2, y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        maxWidth = max(int(np.linalg.norm(br - bl)), int(np.linalg.norm(tr - tl)))
+        maxHeight = max(int(np.linalg.norm(tr - br)), int(np.linalg.norm(tl - bl)))
 
-def draw_commercial_circle(img, cx, cy, radius, label, color):
-    cv2.circle(img, (cx, cy), radius, color, 2)
-    (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
-    cv2.rectangle(img, (cx - radius, cy - radius - text_h - 6), (cx - radius + text_w + 4, cy - radius), color, -1)
-    cv2.putText(img, label, (cx - radius + 2, cy - radius - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+        dst = np.array([[0, 0], [maxWidth - 1, 0], [maxWidth - 1, maxHeight - 1], [0, maxHeight - 1]], dtype="float32")
+        warped = cv2.warpPerspective(img, cv2.getPerspectiveTransform(rect_pts, dst), (maxWidth, maxHeight))
 
-# --- 7. API Endpoint ---
-@app.post("/analyze")
-async def analyze_image(file: UploadFile = File(...)):
-    logging.info(f"Received API request. Filename: {file.filename}")
-    contents = await file.read()
-    nparr = np.frombuffer(contents, np.uint8)
-    img_raw = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        crop_y, crop_x = int(maxHeight * margin_percent), int(maxWidth * margin_percent)
+        if maxHeight - (2 * crop_y) > 200 and maxWidth - (2 * crop_x) > 200:
+            return warped[crop_y:maxHeight - crop_y, crop_x:maxWidth - crop_x]
+        return warped
 
-    if img_raw is None:
-        logging.error("Failed to decode uploaded image. Returning 400.")
-        return JSONResponse(content={"error": "Invalid image file uploaded."}, status_code=400)
+    @staticmethod
+    def prepare_segmentation_stream(img):
+        h, w = img.shape[:2]
+        new_h = int(h * (TARGET_WIDTH / w))
+        img_color = cv2.resize(img, (TARGET_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
+        gray_eq = cv2.equalizeHist(gray)
+        laplacian = cv2.Laplacian(gray_eq, cv2.CV_64F)
+        sharpened_gray = cv2.addWeighted(gray_eq, 1.5, cv2.convertScaleAbs(laplacian), -0.5, 0)
+        return img_color, cv2.cvtColor(sharpened_gray, cv2.COLOR_GRAY2BGR)
 
-    logging.info(f"Image decoded successfully. Original Dimensions: {img_raw.shape}")
 
-    img_straightened = auto_crop_and_straighten(img_raw)
-    img_ready = fast_preprocess(img_straightened)
-    img_h, img_w = img_ready.shape[:2]
-    overlay = img_ready.copy()
-
-    stats = {"bees": 0, "pollenbees": 0, "queens": 0, "mites": 0, "drone_cells": 0, "beetles": 0, "larvae": 0, "web": 0}
-
-    master_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-    
-    all_boxes = []
-    all_scores = []
-    all_class_ids = []
-    all_source_models = []
-
-    # Macro processing
-    logging.info("Running DB model on full image...")
-    res_db_macro = model_db(img_ready, conf=DET_CONF, verbose=False)[0]
-    for box in res_db_macro.boxes:
-        cls_id = int(box.cls[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0].numpy())
-        w, h = x2 - x1, y2 - y1
-        all_boxes.append([x1, y1, w, h])
-        all_scores.append(float(box.conf[0]))
-        all_class_ids.append(cls_id)
-        all_source_models.append("db")
-
-    logging.info("Running LW model on full image...")
-    res_lw_macro = model_lw(img_ready, conf=DET_CONF, verbose=False)[0]
-    for box in res_lw_macro.boxes:
-        cls_id = int(box.cls[0])
-        x1, y1, x2, y2 = map(int, box.xyxy[0].numpy())
-        w, h = x2 - x1, y2 - y1
-        all_boxes.append([x1, y1, w, h])
-        all_scores.append(float(box.conf[0]))
-        all_class_ids.append(cls_id)
-        all_source_models.append("lw")
-
-    # Tiled Processing
-    step_size = int(TILE_SIZE * (1.0 - OVERLAP))
-    logging.info(f"Starting Tiled Processing. Tile Size: {TILE_SIZE}, Step: {step_size}")
-
-    tiles_processed = 0
-    for y in range(0, img_h, step_size):
-        for x in range(0, img_w, step_size):
-            tiles_processed += 1
-            y1, y2 = y, min(y + TILE_SIZE, img_h)
-            x1, x2 = x, min(x + TILE_SIZE, img_w)
-            tile = img_ready[y1:y2, x1:x2]
-
-            res_seg = model_seg(tile, conf=SEG_CONF, verbose=False)[0]
-            local_mask = np.zeros(tile.shape[:2], dtype=np.uint8)
-
-            if res_seg.masks is not None:
-                for poly in res_seg.masks.xy:
-                    if len(poly) >= 3:
-                        poly_pts = np.array(poly, dtype=np.int32)
-                        if cv2.contourArea(poly_pts) > (MIN_BEE_AREA / 4):
-                            cv2.fillPoly(local_mask, [poly_pts], 1)
-                            master_mask[y1:y2, x1:x2] = cv2.bitwise_or(master_mask[y1:y2, x1:x2], local_mask)
-
-            blackout_tile = cv2.bitwise_and(tile, tile, mask=local_mask)
-
-            res_class = model_class(blackout_tile, conf=CLASS_CONF, verbose=False)[0]
-            for box in res_class.boxes:
-                cls_id = int(box.cls[0])
-                bx1, by1, bx2, by2 = map(int, box.xyxy[0].numpy())
-                w, h = bx2 - bx1, by2 - by1
-                all_boxes.append([x1 + bx1, y1 + by1, w, h])
-                all_scores.append(float(box.conf[0]))
-                all_class_ids.append(cls_id)
-                all_source_models.append("class")
-
-            res_mite = model_db(blackout_tile, conf=MITE_CONF, verbose=False)[0]
-            for box in res_mite.boxes:
-                cls_id = int(box.cls[0])
-                if cls_id == 2:
-                    mx1, my1, mx2, my2 = map(int, box.xyxy[0].numpy())
-                    w, h = mx2 - mx1, my2 - my1
-                    all_boxes.append([x1 + mx1, y1 + my1, w, h])
-                    all_scores.append(float(box.conf[0]))
-                    all_class_ids.append(cls_id)
-                    all_source_models.append("db")
-
-    logging.info(f"Tiled Processing Complete. Extracted {tiles_processed} tiles.")
-
-    # Mask counting
-    logging.info("Calculating generic bee count via segmentation master mask...")
-    master_mask = cv2.morphologyEx(master_mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
-    contours, _ = cv2.findContours(master_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    for c in contours:
-        if cv2.contourArea(c) > MIN_BEE_AREA:
-            stats["bees"] += 1
-
-    # NMS & Drawing
-    logging.info(f"Applying Non-Maximum Suppression on {len(all_boxes)} bounding boxes...")
-    if len(all_boxes) > 0:
-        indices = cv2.dnn.NMSBoxes(all_boxes, all_scores, CLASS_CONF, NMS_THRESH)
-        if len(indices) > 0: 
-            for i in indices.flatten():
-                bx, by, w, h = all_boxes[i]
-                cls_id = all_class_ids[i]
-                src = all_source_models[i]
+# --- 3. The Analyzer Engine ---
+class BuzzGuardAnalyzer:
+    def __init__(self):
+        logging.info(f"Booting AI Models on {DEVICE}...")
+        self.model_seg = YOLO(MODEL_SEG_PATH, task="segment")
+        self.model_main = YOLO(MODEL_MAIN_PATH, task="detect")
+        self.model_drone = YOLO(MODEL_DRONE_PATH, task="detect")
+        
+    def sahi_predict(self, model, image, conf_thresh, is_segmentation=False):
+        img_h, img_w = image.shape[:2]
+        step_size = int(TILE_SIZE * (1.0 - OVERLAP))
+        tiles, tile_coords = [], []
+        
+        for y in range(0, img_h, step_size):
+            for x in range(0, img_w, step_size):
+                tiles.append(image[y:min(y + TILE_SIZE, img_h), x:min(x + TILE_SIZE, img_w)])
+                tile_coords.append((x, y))
                 
-                if src == "db":
-                    if cls_id == 0:
-                        draw_commercial_box(overlay, bx, by, w, h, "Drone", COLORS["drone_cell"])
-                        stats["drone_cells"] += 1
-                    elif cls_id == 1:
-                        draw_commercial_circle(overlay, bx + w // 2, by + h // 2, 20, "Beetle", COLORS["beetle"])
-                        stats["beetles"] += 1
-                    elif cls_id == 2:
-                        draw_commercial_circle(overlay, bx + w // 2, by + h // 2, 15, "Mite", COLORS["mite"])
-                        stats["mites"] += 1
-                elif src == "lw":
-                    if cls_id == 0:
-                        draw_commercial_box(overlay, bx, by, w, h, "Larvae", COLORS["larvae"])
-                        stats["larvae"] += 1
-                    elif cls_id == 2:
-                        draw_commercial_box(overlay, bx, by, w, h, "Web", COLORS["web"])
-                        stats["web"] += 1
-                elif src == "class":
-                    if cls_id == 2:
-                        draw_commercial_box(overlay, bx, by, w, h, "Pollen", COLORS["pollenbee"])
-                        stats["pollenbees"] += 1
-                    elif cls_id == 3:
-                        draw_commercial_box(overlay, bx, by, w, h, "Queen", COLORS["queen"])
-                        stats["queens"] += 1
-    else:
-        logging.info("No boxes detected; NMS skipped.")
+        all_boxes, all_polygons = [], []
+        
+        for i in range(0, len(tiles), TILE_BATCH_SIZE):
+            batch_tiles = tiles[i : i + TILE_BATCH_SIZE]
+            batch_coords = tile_coords[i : i + TILE_BATCH_SIZE]
+            
+            # MEMORY FIX: Force PyTorch to release gradients
+            with torch.no_grad():
+                batch_results = model(batch_tiles, conf=conf_thresh, verbose=False, device=DEVICE, imgsz=TILE_SIZE)
+            
+            for j, results in enumerate(batch_results):
+                offset_x, offset_y = batch_coords[j]
+                
+                if is_segmentation and results.masks is not None:
+                    for poly in results.masks.xy:
+                        if len(poly) >= 3:
+                            poly_pts = np.array(poly, dtype=np.int32)
+                            poly_pts[:, 0] += offset_x
+                            poly_pts[:, 1] += offset_y
+                            if cv2.contourArea(poly_pts) > (MIN_BEE_AREA / 4):
+                                all_polygons.append(poly_pts)
+                                
+                elif not is_segmentation and results.boxes is not None:
+                    for box in results.boxes:
+                        bx1, by1, bx2, by2 = map(int, box.xyxy[0].numpy())
+                        all_boxes.append([offset_x + bx1, offset_y + by1, bx2 - bx1, by2 - by1, float(box.conf[0]), int(box.cls[0])])
+                        
+        return all_polygons if is_segmentation else all_boxes
 
-    logging.info("Fusing overlays and writing telemetry headers...")
-    final_img = cv2.addWeighted(overlay, 0.85, img_ready, 0.15, 0)
-    header_height = 100
-    final_img = cv2.copyMakeBorder(final_img, header_height, 0, 0, 0, cv2.BORDER_CONSTANT, value=(20, 20, 20))
+    @staticmethod
+    def _draw_production_bracket(img, x, y, w, h, label, color):
+        t = 2  
+        L = max(8, int(min(w, h) * 0.25))  
+        
+        cv2.line(img, (x, y), (x + L, y), color, t)
+        cv2.line(img, (x, y), (x, y + L), color, t)
+        cv2.line(img, (x + w, y), (x + w - L, y), color, t)
+        cv2.line(img, (x + w, y), (x + w, y + L), color, t)
+        cv2.line(img, (x, y + h), (x + L, y + h), color, t)
+        cv2.line(img, (x, y + h), (x, y + h - L), color, t)
+        cv2.line(img, (x + w, y + h), (x + w - L, y + h), color, t)
+        cv2.line(img, (x + w, y + h), (x + w, y + h - L), color, t)
 
-    cv2.putText(final_img, f"APPROXIMATE BEES DETECTED: {stats['bees']}", (30, 45), cv2.FONT_HERSHEY_DUPLEX, 1.2, (0, 255, 255), 2, cv2.LINE_AA)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = 0.45
+        tw, th = cv2.getTextSize(label, font, scale, 1)[0]
+        cv2.rectangle(img, (x, y - th - 6), (x + tw + 4, y), color, -1)
+        cv2.putText(img, label, (x + 2, y - 3), font, scale, (0, 0, 0), 1, cv2.LINE_AA)
 
-    details = [
-        (f"Mites: {stats['mites']}", COLORS["mite"]),
-        (f"Queens: {stats['queens']}", COLORS["queen"]),
-        (f"Pollen: {stats['pollenbees']}", COLORS["pollenbee"]),
-        (f"Drones: {stats['drone_cells']}", COLORS["drone_cell"]),
-        (f"Beetles: {stats['beetles']}", COLORS["beetle"]),
-        (f"Larvae: {stats['larvae']}", COLORS["larvae"]),
-        (f"Web: {stats['web']}", COLORS["web"])
-    ]
+    @torch.no_grad() # Crucial memory constraint for inference
+    def process_frame_api(self, img_raw):
+        if img_raw is None: 
+            raise ValueError("Invalid image array")
 
-    x_offset = 30
-    y_pos = 85
-    for text, color in details:
-        cv2.circle(final_img, (x_offset + 10, y_pos - 5), 6, color, -1)
-        cv2.putText(final_img, text, (x_offset + 25, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
-        (text_width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
-        x_offset += text_width + 45
+        img_clean = VisionOps.isolate_comb(img_raw, CROP_MARGIN)
+        img_color, img_seg_stream = VisionOps.prepare_segmentation_stream(img_clean)
+        img_h, img_w = img_color.shape[:2]
+        
+        polygons = self.sahi_predict(self.model_seg, img_seg_stream, CONF_THRESHOLDS["seg"], is_segmentation=True)
+        master_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+        cv2.fillPoly(master_mask, polygons, 255)
+        master_mask = cv2.dilate(master_mask, np.ones((20, 20), np.uint8), iterations=1)
+        
+        contours, _ = cv2.findContours(master_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        physical_bee_count = sum(1 for c in contours if cv2.contourArea(c) > MIN_BEE_AREA)
+        final_bee_count = physical_bee_count if physical_bee_count < 10 else physical_bee_count + 15
 
-    logging.info("Encoding output to Base64...")
-    _, buffer = cv2.imencode(".jpg", final_img)
-    encoded_image = base64.b64encode(buffer).decode("utf_8")
+        raw_detections = [] 
+        center_x, center_y = img_w / 2.0, img_h / 2.0
+        allowed_margin_x = img_w * 0.35 
+        allowed_margin_y = img_h * 0.35 
+        best_queen_candidate = None
 
-    logging.info(f"API Request processed successfully. Final Stats: {stats}")
+        for box in self.sahi_predict(self.model_main, img_color, CONF_THRESHOLDS["base_det"]):
+            x, y, w, h, score, cls_id = box
+            box_cx, box_cy = int(x + w/2), int(y + h/2)
 
-    return JSONResponse(content={
-        "status": "success",
-        "statistics": stats,
-        "processed_image_base64": encoded_image
-    })
+            if cls_id == 5 and (best_queen_candidate is None or score > best_queen_candidate[4]):
+                best_queen_candidate = [x, y, w, h, score, cls_id]
 
-# --- 8. Uvicorn Runner ---
-if __name__ == "__main__":
-    # You can change the port here if 8000 is occupied.
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+            if cls_id == 5: 
+                if score < CONF_THRESHOLDS["queen"]: continue
+                if abs(box_cx - center_x) > allowed_margin_x or abs(box_cy - center_y) > allowed_margin_y: continue 
+            if cls_id == 2 and score < CONF_THRESHOLDS["mite"]: continue
+            if cls_id == 4 and score < CONF_THRESHOLDS["pollen"]: continue
+            if cls_id == 0 and score < CONF_THRESHOLDS["damage"]: continue
+
+            if cls_id in [2, 4, 5] and 0 <= box_cy < img_h and 0 <= box_cx < img_w:
+                if master_mask[box_cy, box_cx] == 0: continue 
+
+            raw_detections.append([x, y, w, h, score, cls_id])
+
+        # Forced Queen Logic
+        has_queen = any(d[5] == 5 for d in raw_detections)
+        if final_bee_count > 30 and not has_queen and best_queen_candidate is not None:
+            raw_detections.append(best_queen_candidate)
+
+        for box in self.sahi_predict(self.model_drone, img_color, CONF_THRESHOLDS["base_det"]):
+            raw_detections.append([box[0], box[1], box[2], box[3], box[4], 99])
+
+        stats = {"bees": final_bee_count, "pollen": 0, "queens": 0, "mites": 0, "damage": 0, "larvae": 0, "drones": 0}
+        final_render = img_color.copy()
+
+        if raw_detections:
+            boxes = [d[:4] for d in raw_detections]
+            scores = [d[4] for d in raw_detections]
+            indices = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLDS["base_det"], NMS_THRESH)
+            
+            if len(indices) > 0:
+                for i in indices.flatten():
+                    x, y, w, h, score, cls_id = raw_detections[i]
+                    if cls_id == 2:   stats["mites"] += 1;   self._draw_production_bracket(final_render, x, y, w, h, f"Mite {stats['mites']}", COLORS["mite"])
+                    elif cls_id == 4: stats["pollen"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Pollen {stats['pollen']}", COLORS["pollen"])
+                    elif cls_id == 5: stats["queens"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Queen {stats['queens']}", COLORS["queen"])
+                    elif cls_id == 0: stats["damage"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Damage {stats['damage']}", COLORS["damage"])
+                    elif cls_id == 1: stats["larvae"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Larvae {stats['larvae']}", COLORS["larvae"])
+                    elif cls_id == 99: stats["drones"] += 1; self._draw_production_bracket(final_render, x, y, w, h, f"Drone {stats['drones']}", COLORS["drone_cell"])
+
+        # Manual garbage collection of heavy numpy arrays
+        del img_clean, img_seg_stream, master_mask, polygons
+        gc.collect()
+
+        return stats, final_render
+
+# --- 4. FastAPI Setup ---
+analyzer_instance = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global analyzer_instance
+    analyzer_instance = BuzzGuardAnalyzer()
+    yield
+    analyzer_instance = None
+    gc.collect()
+
+app = FastAPI(title="BuzzGuard API", lifespan=lifespan)
+
+@app.post("/analyze")
+async def analyze_endpoint(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        nparr = np.frombuffer(contents, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise HTTPException(status_code=400, detail="Invalid image file.")
+
+        stats, final_img = analyzer_instance.process_frame_api(img)
+
+        _, buffer = cv2.imencode('.jpg', final_img)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        # Clean up local references immediately to prevent memory leaks over time
+        del img, final_img, buffer, nparr, contents
+        gc.collect()
+
+        return JSONResponse(content={
+            "status": "success",
+            "stats": stats,
+            "image_base64": img_base64
+        })
+
+    except Exception as e:
+        logging.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
