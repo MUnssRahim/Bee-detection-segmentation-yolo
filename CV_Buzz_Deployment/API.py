@@ -19,10 +19,10 @@ MODEL_MAIN_PATH = os.path.join(SCRIPT_DIR, "Combined_Final.pt")
 MODEL_DRONE_PATH = os.path.join(SCRIPT_DIR, "B_D_V.pt")     
 
 TARGET_WIDTH = 1280
-TILE_SIZE = 640
-OVERLAP = 0.20  # Optimized for speed and lower memory footprint
+TILE_SIZE = 512      
+OVERLAP = 0.30       
 CROP_MARGIN = 0.12 
-TILE_BATCH_SIZE = 4  # Reduced batch size to prevent RAM spikes on Railway
+TILE_BATCH_SIZE = 4
 
 # FORCED CPU: Railway does not have GPUs. Forcing CPU prevents PyTorch from allocating CUDA memory.
 USE_HALF_PRECISION = False 
@@ -31,8 +31,8 @@ DEVICE = "cpu"
 CONF_THRESHOLDS = {
     "seg": 0.25,
     "base_det": 0.20,
-    "mite": 0.1,
-    "pollen": 0.30,
+    "mite": 0.05,    
+    "pollen": 0.10,  
     "queen": 0.35,
     "damage": 0.6  
 }
@@ -63,7 +63,6 @@ class VisionOps:
     def isolate_comb(img, margin_percent):
         h_orig, w_orig = img.shape[:2]
         
-        # Memory/Speed Optimization: Downscale for morphology
         scale = 0.25
         small_img = cv2.resize(img, (int(w_orig * scale), int(h_orig * scale)))
         gray = cv2.cvtColor(small_img, cv2.COLOR_BGR2GRAY)
@@ -98,16 +97,51 @@ class VisionOps:
         return warped
 
     @staticmethod
-    def prepare_segmentation_stream(img):
+    def prepare_dual_streams(img):
         h, w = img.shape[:2]
         new_h = int(h * (TARGET_WIDTH / w))
-        img_color = cv2.resize(img, (TARGET_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
-        gray = cv2.cvtColor(img_color, cv2.COLOR_BGR2GRAY)
-        gray_eq = cv2.equalizeHist(gray)
-        laplacian = cv2.Laplacian(gray_eq, cv2.CV_64F)
-        sharpened_gray = cv2.addWeighted(gray_eq, 1.5, cv2.convertScaleAbs(laplacian), -0.5, 0)
-        return img_color, cv2.cvtColor(sharpened_gray, cv2.COLOR_GRAY2BGR)
+        img_resized = cv2.resize(img, (TARGET_WIDTH, new_h), interpolation=cv2.INTER_LINEAR)
+        
+        lab = cv2.cvtColor(img_resized, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe_color = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        cl = clahe_color.apply(l)
+        color_stream = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+        
+        gray = cv2.cvtColor(img_resized, cv2.COLOR_BGR2GRAY)
+        
+        smoothed = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+        
+        clahe_seg = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        gray_clahe = clahe_seg.apply(smoothed)
+        
+        seg_stream = cv2.cvtColor(gray_clahe, cv2.COLOR_GRAY2BGR)
+        
+        return color_stream, seg_stream
 
+    @staticmethod
+    def calculate_honey_percentage(img):
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        
+        lower_capped = np.array([0, 0, 100])  
+        upper_capped = np.array([60, 180, 255]) 
+        
+        mask = cv2.inRange(hsv, lower_capped, upper_capped)
+        
+        kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open)
+        
+        kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close)
+        
+        honey_pixels = cv2.countNonZero(mask)
+        total_pixels = img.shape[0] * img.shape[1]
+        
+        raw_percent = (honey_pixels / total_pixels) * 100
+        
+        adjusted_percent = raw_percent * 0.60
+        
+        return round(adjusted_percent, 2)
 
 # --- 3. The Analyzer Engine ---
 class BuzzGuardAnalyzer:
@@ -133,7 +167,6 @@ class BuzzGuardAnalyzer:
             batch_tiles = tiles[i : i + TILE_BATCH_SIZE]
             batch_coords = tile_coords[i : i + TILE_BATCH_SIZE]
             
-            # MEMORY FIX: Force PyTorch to release gradients
             with torch.no_grad():
                 batch_results = model(batch_tiles, conf=conf_thresh, verbose=False, device=DEVICE, imgsz=TILE_SIZE)
             
@@ -176,23 +209,35 @@ class BuzzGuardAnalyzer:
         cv2.rectangle(img, (x, y - th - 6), (x + tw + 4, y), color, -1)
         cv2.putText(img, label, (x + 2, y - 3), font, scale, (0, 0, 0), 1, cv2.LINE_AA)
 
-    @torch.no_grad() # Crucial memory constraint for inference
+    @torch.no_grad() 
     def process_frame_api(self, img_raw):
         if img_raw is None: 
             raise ValueError("Invalid image array")
 
         img_clean = VisionOps.isolate_comb(img_raw, CROP_MARGIN)
-        img_color, img_seg_stream = VisionOps.prepare_segmentation_stream(img_clean)
-        img_h, img_w = img_color.shape[:2]
+        color_stream, seg_stream = VisionOps.prepare_dual_streams(img_clean)
+        img_h, img_w = color_stream.shape[:2]
         
-        polygons = self.sahi_predict(self.model_seg, img_seg_stream, CONF_THRESHOLDS["seg"], is_segmentation=True)
+        honey_percentage = VisionOps.calculate_honey_percentage(color_stream)
+        
+        # Run segmentation silently for counting and boundary mapping
+        polygons = self.sahi_predict(self.model_seg, seg_stream, CONF_THRESHOLDS["seg"], is_segmentation=True)
+        del seg_stream 
+        
+        physical_bee_count = len(polygons)
+        
         master_mask = np.zeros((img_h, img_w), dtype=np.uint8)
         cv2.fillPoly(master_mask, polygons, 255)
         master_mask = cv2.dilate(master_mask, np.ones((20, 20), np.uint8), iterations=1)
         
-        contours, _ = cv2.findContours(master_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        physical_bee_count = sum(1 for c in contours if cv2.contourArea(c) > MIN_BEE_AREA)
-        final_bee_count = physical_bee_count if physical_bee_count < 10 else physical_bee_count + 15
+        if physical_bee_count > 100:
+            final_bee_count = int(physical_bee_count * 0.8)
+        elif physical_bee_count > 20:
+            final_bee_count = physical_bee_count + 15
+        elif physical_bee_count <= 10:
+            final_bee_count = max(0, physical_bee_count - 5)
+        else:
+            final_bee_count = physical_bee_count
 
         raw_detections = [] 
         center_x, center_y = img_w / 2.0, img_h / 2.0
@@ -200,7 +245,7 @@ class BuzzGuardAnalyzer:
         allowed_margin_y = img_h * 0.35 
         best_queen_candidate = None
 
-        for box in self.sahi_predict(self.model_main, img_color, CONF_THRESHOLDS["base_det"]):
+        for box in self.sahi_predict(self.model_main, color_stream, CONF_THRESHOLDS["base_det"]):
             x, y, w, h, score, cls_id = box
             box_cx, box_cy = int(x + w/2), int(y + h/2)
 
@@ -214,21 +259,27 @@ class BuzzGuardAnalyzer:
             if cls_id == 4 and score < CONF_THRESHOLDS["pollen"]: continue
             if cls_id == 0 and score < CONF_THRESHOLDS["damage"]: continue
 
-            if cls_id in [2, 4, 5] and 0 <= box_cy < img_h and 0 <= box_cx < img_w:
+            # Only pollen and queens are strictly restricted to the segmented bee boundaries
+            if cls_id in [4, 5] and 0 <= box_cy < img_h and 0 <= box_cx < img_w:
                 if master_mask[box_cy, box_cx] == 0: continue 
 
             raw_detections.append([x, y, w, h, score, cls_id])
 
-        # Forced Queen Logic
         has_queen = any(d[5] == 5 for d in raw_detections)
         if final_bee_count > 30 and not has_queen and best_queen_candidate is not None:
             raw_detections.append(best_queen_candidate)
 
-        for box in self.sahi_predict(self.model_drone, img_color, CONF_THRESHOLDS["base_det"]):
+        for box in self.sahi_predict(self.model_drone, color_stream, CONF_THRESHOLDS["base_det"]):
             raw_detections.append([box[0], box[1], box[2], box[3], box[4], 99])
 
-        stats = {"bees": final_bee_count, "pollen": 0, "queens": 0, "mites": 0, "damage": 0, "larvae": 0, "drones": 0}
-        final_render = img_color.copy()
+        stats = {
+            "Approximate Bees": final_bee_count, 
+            "pollen": 0, "queens": 0, "mites": 0, 
+            "damage": 0, "larvae": 0, "drones": 0,
+            "approximate_honey_percentage": f"{honey_percentage}%"
+        }
+        
+        final_render = color_stream.copy()
 
         if raw_detections:
             boxes = [d[:4] for d in raw_detections]
@@ -238,15 +289,14 @@ class BuzzGuardAnalyzer:
             if len(indices) > 0:
                 for i in indices.flatten():
                     x, y, w, h, score, cls_id = raw_detections[i]
-                    if cls_id == 2:   stats["mites"] += 1;   self._draw_production_bracket(final_render, x, y, w, h, f"Mite {stats['mites']}", COLORS["mite"])
+                    if cls_id == 2:   stats["mites"] += 1;   self._draw_production_bracket(final_render, x, y, w, h, f"Potential Mite {stats['mites']}", COLORS["mite"])
                     elif cls_id == 4: stats["pollen"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Pollen {stats['pollen']}", COLORS["pollen"])
                     elif cls_id == 5: stats["queens"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Queen {stats['queens']}", COLORS["queen"])
                     elif cls_id == 0: stats["damage"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Damage {stats['damage']}", COLORS["damage"])
                     elif cls_id == 1: stats["larvae"] += 1;  self._draw_production_bracket(final_render, x, y, w, h, f"Larvae {stats['larvae']}", COLORS["larvae"])
                     elif cls_id == 99: stats["drones"] += 1; self._draw_production_bracket(final_render, x, y, w, h, f"Drone {stats['drones']}", COLORS["drone_cell"])
 
-        # Manual garbage collection of heavy numpy arrays
-        del img_clean, img_seg_stream, master_mask, polygons
+        del img_clean, master_mask, polygons
         gc.collect()
 
         return stats, final_render
