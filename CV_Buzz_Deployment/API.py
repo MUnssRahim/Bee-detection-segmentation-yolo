@@ -274,7 +274,7 @@ class BuzzGuardAnalyzer:
 
         stats = {
             "Approximate Bees": final_bee_count, 
-            "pollen": 0, "queens": 0, "mite": 0, 
+            "pollen": 0, "queens": 0, "mites": 0, 
             "damage": 0, "larvae": 0, "drones": 0,
             "approximate_honey_percentage": f"{honey_percentage}%"
         }
