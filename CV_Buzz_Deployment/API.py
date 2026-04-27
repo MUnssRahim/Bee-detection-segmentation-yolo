@@ -273,10 +273,10 @@ class BuzzGuardAnalyzer:
             raw_detections.append([box[0], box[1], box[2], box[3], box[4], 99])
 
         stats = {
-            "Approximate Bees": final_bee_count, 
-            "pollen": 0, "queens": 0, "mites": 0, 
+            "Approximate_Bees": final_bee_count, 
+            "pollen": 0, "queens": 0, "Potential_mite": 0, 
             "damage": 0, "larvae": 0, "drones": 0,
-            "approximate_honey_percentage": f"{honey_percentage}%"
+            "Approximate_honey_percentage": f"{honey_percentage}%"
         }
         
         final_render = color_stream.copy()
