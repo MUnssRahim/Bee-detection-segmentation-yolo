@@ -6,11 +6,27 @@ import os
 
 app = FastAPI()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def resolve_model_path(*candidates):
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
 # ---------------------------------------------------------
 # 1. MODEL PATHS (CASE-SENSITIVE — AZURE LINUX)
 # ---------------------------------------------------------
-MODEL_PESTS_PATH = "./Models/Beetle_Drone_Varroa.onnx"
-MODEL_QUEEN_PATH = "./Models/ModelIterationDeteection2.onnx"
+MODEL_PESTS_PATH = resolve_model_path(
+    os.path.join(BASE_DIR, "models", "Beetle_Drone_Varroa.onnx"),
+    os.path.join(BASE_DIR, "Models", "Beetle_Drone_Varroa.onnx"),
+)
+MODEL_QUEEN_PATH = resolve_model_path(
+    os.path.join(BASE_DIR, "models", "ModelIterationDeteection2.onnx"),
+    os.path.join(BASE_DIR, "Models", "ModelIterationDeteection2.onnx"),
+)
 
 model_pests = None
 model_queen = None
